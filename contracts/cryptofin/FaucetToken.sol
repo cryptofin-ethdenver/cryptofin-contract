@@ -2,7 +2,7 @@
 
 pragma solidity ^0.8.9;
 
-import "../common/token/ERC20/IERC20.sol";
+import "./IERC20.sol";
 
 contract FaucetToken is IERC20 {
     uint public totalSupply;

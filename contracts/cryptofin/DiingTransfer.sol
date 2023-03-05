@@ -1,8 +1,12 @@
+pragma solidity ^0.8.9;
+
+import "./IVerifier.sol";
+
 // SPDX-License-Identifier: MIT
 
 pragma solidity ^0.8.9;
 
-contract Hasher {
+library Hasher {
     uint constant FIELD_SIZE = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
 
     function MiMCSponge(uint256 xL, uint256 xR) public pure returns (uint256, uint256) {
@@ -1777,5 +1781,327 @@ contract Hasher {
         R = addmod(R, uint256(_right), FIELD_SIZE);
         (R, C) = MiMCSponge(R, C);
         return R;
+    }
+}
+
+// File: MerkleTreeWithHistory.sol
+
+contract MerkleTreeWithHistory {
+    uint256 public constant FIELD_SIZE = 21888242871839275222246405745257275088548364400416034343698204186575808495617;
+    uint256 public constant ZERO_VALUE = 21663839004416932945382355908790599225266501822907911457504978515578255421292; // = keccak256("tornado") % FIELD_SIZE
+
+    uint32 public levels;
+
+    // the following variables are made public for easier testing and debugging and
+    // are not supposed to be accessed in regular code
+    bytes32[] public filledSubtrees;
+    bytes32[] public zeros;
+    uint32 public currentRootIndex = 0;
+    uint32 public nextIndex = 0;
+    uint32 public constant ROOT_HISTORY_SIZE = 100;
+    bytes32[ROOT_HISTORY_SIZE] public roots;
+
+    constructor(uint32 _treeLevels) public {
+        require(_treeLevels > 0, "_treeLevels should be greater than zero");
+        require(_treeLevels < 32, "_treeLevels should be less than 32");
+        levels = _treeLevels;
+
+        bytes32 currentZero = bytes32(ZERO_VALUE);
+        zeros.push(currentZero);
+        filledSubtrees.push(currentZero);
+
+        for (uint32 i = 1; i < levels; i++) {
+            currentZero = hashLeftRight(currentZero, currentZero);
+            zeros.push(currentZero);
+            filledSubtrees.push(currentZero);
+        }
+
+        roots[0] = hashLeftRight(currentZero, currentZero);
+    }
+
+    /**
+@dev Hash 2 tree leaves, returns MiMC(_left, _right)
+  */
+    function hashLeftRight(bytes32 _left, bytes32 _right) public pure returns (bytes32) {
+        require(uint256(_left) < FIELD_SIZE, "_left should be inside the field");
+        require(uint256(_right) < FIELD_SIZE, "_right should be inside the field");
+        uint256 R = uint256(_left);
+        uint256 C = 0;
+        (R, C) = Hasher.MiMCSponge(R, C);
+        R = addmod(R, uint256(_right), FIELD_SIZE);
+        (R, C) = Hasher.MiMCSponge(R, C);
+        return bytes32(R);
+    }
+
+    function _insert(bytes32 _leaf) internal returns(uint32 index) {
+        uint32 currentIndex = nextIndex;
+        require(currentIndex != uint32(2)**levels, "Merkle tree is full. No more leafs can be added");
+        nextIndex += 1;
+        bytes32 currentLevelHash = _leaf;
+        bytes32 left;
+        bytes32 right;
+
+        for (uint32 i = 0; i < levels; i++) {
+            if (currentIndex % 2 == 0) {
+                left = currentLevelHash;
+                right = zeros[i];
+
+                filledSubtrees[i] = currentLevelHash;
+            } else {
+                left = filledSubtrees[i];
+                right = currentLevelHash;
+            }
+
+            currentLevelHash = hashLeftRight(left, right);
+
+            currentIndex /= 2;
+        }
+
+        currentRootIndex = (currentRootIndex + 1) % ROOT_HISTORY_SIZE;
+        roots[currentRootIndex] = currentLevelHash;
+        return nextIndex - 1;
+    }
+
+    /**
+@dev Whether the root is present in the root history
+  */
+    function isKnownRoot(bytes32 _root) public view returns(bool) {
+        if (_root == 0) {
+            return false;
+        }
+        uint32 i = currentRootIndex;
+        do {
+            if (_root == roots[i]) {
+                return true;
+            }
+            if (i == 0) {
+                i = ROOT_HISTORY_SIZE;
+            }
+            i--;
+        } while (i != currentRootIndex);
+        return false;
+    }
+
+    /**
+@dev Returns the last root
+  */
+    function getLastRoot() public view returns(bytes32) {
+        return roots[currentRootIndex];
+    }
+}
+
+// File: @openzeppelin/contracts/utils/ReentrancyGuard.sol
+
+pragma solidity ^0.8.9;
+
+/**
+ * @dev Contract module that helps prevent reentrant calls to a function.
+ *
+ * Inheriting from `ReentrancyGuard` will make the {nonReentrant} modifier
+ * available, which can be applied to functions to make sure there are no nested
+ * (reentrant) calls to them.
+ *
+ * Note that because there is a single `nonReentrant` guard, functions marked as
+ * `nonReentrant` may not call one another. This can be worked around by making
+ * those functions `private`, and then adding `external` `nonReentrant` entry
+ * points to them.
+ */
+contract ReentrancyGuard {
+    // counter to allow mutex lock with only one SSTORE operation
+    uint256 private _guardCounter;
+
+    constructor () {
+        // The counter starts at one to prevent changing it from zero to a non-zero
+        // value, which is a more expensive operation.
+        _guardCounter = 1;
+    }
+
+    /**
+     * @dev Prevents a contract from calling itself, directly or indirectly.
+     * Calling a `nonReentrant` function from another `nonReentrant`
+     * function is not supported. It is possible to prevent this from happening
+     * by making the `nonReentrant` function external, and make it call a
+     * `private` function that does the actual work.
+     */
+    modifier nonReentrant() {
+        _guardCounter += 1;
+        uint256 localCounter = _guardCounter;
+        _;
+        require(localCounter == _guardCounter, "ReentrancyGuard: reentrant call");
+    }
+}
+
+// File: DiingTransfer.sol
+
+contract DiingTransfer is MerkleTreeWithHistory, ReentrancyGuard {
+    struct TransferInfo {
+        bool isOccupied;
+        address from;
+        address tokenAddress;
+        uint256 amount;
+        bool isWithdrawn;
+    }
+
+    uint256 public denomination;
+    mapping(bytes32 => TransferInfo) public nullifierHashes;
+    // we store all commitments just to prevent accidental deposits with the same commitment
+    mapping(bytes32 => bool) public commitments;
+    IVerifier public verifier;
+
+    // operator can update snark verification key
+    // after the final trusted setup ceremony operator rights are supposed to be transferred to zero address
+    address public operator;
+    modifier onlyOperator {
+        require(msg.sender == operator, "Only operator can call this function.");
+        _;
+    }
+
+    event Deposit(address indexed from, bytes32 indexed nullifierHash, bytes32 indexed commitment, uint32 leafIndex, uint256 timestamp);
+    event Withdrawal(address indexed to, address indexed from, address indexed tokenAddress, uint256 amount, bytes32 nullifierHash);
+
+    /**
+    @dev The constructor
+    @param _verifier the address of SNARK verifier for this contract
+    @param _denomination transfer amount for each deposit
+    @param _merkleTreeHeight the height of deposits' Merkle Tree
+    @param _operator operator address (see operator comment above)
+    */
+    constructor(
+        IVerifier _verifier,
+        uint256 _denomination,
+        uint32 _merkleTreeHeight,
+        address _operator
+    ) MerkleTreeWithHistory(_merkleTreeHeight) public {
+        require(_denomination > 0, "denomination should be greater than 0");
+        verifier = _verifier;
+        operator = _operator;
+        denomination = _denomination;
+    }
+
+    /**
+    @dev Deposit funds into the contract. The caller must send (for ETH) with nullifierHash.
+    @param _commitment the note commitment, which is PedersenHash(nullifier + secret)
+    */
+    function depositETH(bytes32 _commitment, bytes32 _nullifierHash) external payable nonReentrant {
+        require(!commitments[_commitment], "The commitment has been submitted");
+        TransferInfo memory transferInfo = nullifierHashes[_nullifierHash];
+        require(transferInfo.isOccupied == false, "The nullifierHash has been occupied");
+        uint32 insertedIndex = _insert(_commitment);
+
+        // Save transfer info
+        transferInfo.isOccupied = true;
+        transferInfo.isWithdrawn = false;
+        transferInfo.amount = msg.value;
+        transferInfo.from = msg.sender;
+        transferInfo.tokenAddress = address(0);
+
+        commitments[_commitment] = true;
+
+        emit Deposit(msg.sender, _nullifierHash, _commitment, insertedIndex, block.timestamp);
+    }
+
+    /**
+    @dev Deposit funds into the contract. The caller must approve (for ERC20) with nullifierHash.
+    @param _commitment the note commitment, which is PedersenHash(nullifier + secret)
+    */
+    function depositERC20(bytes32 _commitment, bytes32 _nullifierHash, address _token, uint256 _amount) external nonReentrant {
+        require(!commitments[_commitment], "The commitment has been submitted");
+        TransferInfo storage transferInfo = nullifierHashes[_nullifierHash];
+        require(transferInfo.isOccupied == false, "The nullifierHash has been occupied");
+        uint32 insertedIndex = _insert(_commitment);
+
+        _safeErc20TransferFrom(_token, msg.sender, address(this), _amount);
+
+        // Save transfer info
+        transferInfo.isOccupied = true;
+        transferInfo.isWithdrawn = false;
+        transferInfo.amount = _amount;
+        transferInfo.from = msg.sender;
+        transferInfo.tokenAddress = _token;
+
+        commitments[_commitment] = true;
+
+        emit Deposit(msg.sender, _nullifierHash, _commitment, insertedIndex, block.timestamp);
+    }
+
+    /**
+    @dev Refund a deposit from the contract. Only depositer can refund.
+    */
+    function refundDeposit(bytes32 _nullifierHash) external nonReentrant {
+        TransferInfo storage transferInfo = nullifierHashes[_nullifierHash];
+        require(transferInfo.from == msg.sender, "Not authroized to refund");
+        require(transferInfo.isWithdrawn == false, "Already withdrawan");
+        if (transferInfo.tokenAddress == address(0)){
+            require(address(this).balance >= transferInfo.amount, "Not enough ETH balance");
+            payable(transferInfo.from).transfer(transferInfo.amount);
+        } else {
+            _safeErc20Transfer(transferInfo.tokenAddress, transferInfo.from, transferInfo.amount);
+        }
+        transferInfo.isWithdrawn = true;
+
+        emit Withdrawal(msg.sender, transferInfo.from, transferInfo.tokenAddress, transferInfo.amount, _nullifierHash);
+    }
+
+    /**
+    @dev Withdraw a deposit from the contract. `proof` is a zkSNARK proof data, and input is an array of circuit public inputs
+    `input` array consists of:
+      - merkle root of all deposits in the contract
+      - hash of unique deposit nullifier to prevent double spends
+      - the recipient of funds
+      - optional fee that goes to the transaction sender (usually a relay)
+    */
+    function withdraw(bytes calldata _proof, bytes32 _root, bytes32 _nullifierHash, address payable _recipient) external payable nonReentrant {
+        TransferInfo storage transferInfo = nullifierHashes[_nullifierHash];
+        require(transferInfo.isOccupied == true, "The note is not exist");
+        require(transferInfo.isWithdrawn == false, "The note has been already spent");
+        require(isKnownRoot(_root), "Cannot find your merkle root"); // Make sure to use a recent one
+        require(verifier.verifyProof(_proof, [uint256(_root), uint256(_nullifierHash), uint256(uint160(address(_recipient)))]), "Invalid withdraw proof");
+
+        if (transferInfo.tokenAddress == address(0)){
+            require(address(this).balance >= transferInfo.amount, "Not enough ETH balance");
+            payable(_recipient).transfer(transferInfo.amount);
+        } else {
+            _safeErc20Transfer(transferInfo.tokenAddress, _recipient, transferInfo.amount);
+        }
+
+        transferInfo.isWithdrawn = true;
+        emit Withdrawal(_recipient, transferInfo.from, transferInfo.tokenAddress, transferInfo.amount, _nullifierHash);
+    }
+
+    /**
+    @dev allow operator to update SNARK verification keys. This is needed to update keys after the final trusted setup ceremony is held.
+    After that operator rights are supposed to be transferred to zero address
+    */
+    function updateVerifier(address _newVerifier) external onlyOperator {
+        verifier = IVerifier(_newVerifier);
+    }
+
+    /** @dev operator can change his address */
+    function changeOperator(address _newOperator) external onlyOperator {
+        operator = _newOperator;
+    }
+
+    function _safeErc20TransferFrom(address _token, address _from, address _to, uint256 _amount) internal {
+        (bool success, bytes memory data) = _token.call(abi.encodeWithSelector(0x23b872dd /* transferFrom */, _from, _to, _amount));
+        require(success, "not enough allowed tokens");
+
+        // if contract returns some data lets make sure that is `true` according to standard
+        if (data.length > 0) {
+            require(data.length == 32, "data length should be either 0 or 32 bytes");
+            success = abi.decode(data, (bool));
+            require(success, "not enough allowed tokens. Token returns false.");
+        }
+    }
+
+    function _safeErc20Transfer(address _token, address _to, uint256 _amount) internal {
+        (bool success, bytes memory data) = _token.call(abi.encodeWithSelector(0xa9059cbb /* transfer */, _to, _amount));
+        require(success, "not enough tokens");
+
+        // if contract returns some data lets make sure that is `true` according to standard
+        if (data.length > 0) {
+            require(data.length == 32, "data length should be either 0 or 32 bytes");
+            success = abi.decode(data, (bool));
+            require(success, "not enough tokens. Token returns false.");
+        }
     }
 }
