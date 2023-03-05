@@ -1942,7 +1942,6 @@ contract DiingTransfer is MerkleTreeWithHistory, ReentrancyGuard {
         bool isWithdrawn;
     }
 
-    uint256 public denomination;
     mapping(bytes32 => TransferInfo) public nullifierHashes;
     // we store all commitments just to prevent accidental deposits with the same commitment
     mapping(bytes32 => bool) public commitments;
@@ -1962,20 +1961,16 @@ contract DiingTransfer is MerkleTreeWithHistory, ReentrancyGuard {
     /**
     @dev The constructor
     @param _verifier the address of SNARK verifier for this contract
-    @param _denomination transfer amount for each deposit
     @param _merkleTreeHeight the height of deposits' Merkle Tree
     @param _operator operator address (see operator comment above)
     */
     constructor(
         IVerifier _verifier,
-        uint256 _denomination,
         uint32 _merkleTreeHeight,
         address _operator
     ) MerkleTreeWithHistory(_merkleTreeHeight) public {
-        require(_denomination > 0, "denomination should be greater than 0");
         verifier = _verifier;
         operator = _operator;
-        denomination = _denomination;
     }
 
     /**
@@ -1984,7 +1979,7 @@ contract DiingTransfer is MerkleTreeWithHistory, ReentrancyGuard {
     */
     function depositETH(bytes32 _commitment, bytes32 _nullifierHash) external payable nonReentrant {
         require(!commitments[_commitment], "The commitment has been submitted");
-        TransferInfo memory transferInfo = nullifierHashes[_nullifierHash];
+        TransferInfo storage transferInfo = nullifierHashes[_nullifierHash];
         require(transferInfo.isOccupied == false, "The nullifierHash has been occupied");
         uint32 insertedIndex = _insert(_commitment);
 
